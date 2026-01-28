@@ -1,0 +1,7 @@
+{
+  "name": "hello2",
+  "version": "0.1.0",
+  "description": "Hello from the repo-installed skill",
+  "entry": "index.js",
+  "commands": ["/hello2"]
+}
