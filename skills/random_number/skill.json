@@ -1,0 +1,10 @@
+{
+  "name": "random_number",
+  "description": "Picks a random number between two numbers provided by the user",
+  "trigger": "/random",
+  "version": "1.0.0",
+  "commands": [
+    "/random_number"
+  ],
+  "entry": "index.js"
+}
