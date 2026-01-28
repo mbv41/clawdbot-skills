@@ -156,22 +156,44 @@ async function callClaude({ system, user }) {
     .trim();
 }
 
-function extractJsonBlock(text) {
-  const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
-  const raw = fenced ? fenced[1] : text;
-  return JSON.parse(raw);
+function extractFencedBlocks(text) {
+  const skillJsonMatch = text.match(/```skilljson\s*([\s\S]*?)\s*```/i);
+  const jsMatch = text.match(/```js\s*([\s\S]*?)\s*```/i);
+
+  if (!skillJsonMatch || !jsMatch) {
+    const preview = (text || "").slice(0, 800);
+    throw new Error(
+      "Model output missing ```skilljson``` or ```js``` block. Preview:\n" + preview
+    );
+  }
+
+  const skillJsonRaw = skillJsonMatch[1].trim();
+  const indexJs = jsMatch[1].replace(/\r\n/g, "\n");
+
+  let skillJson;
+  try {
+    skillJson = JSON.parse(skillJsonRaw);
+  } catch (e) {
+    const preview = skillJsonRaw.slice(0, 800);
+    throw new Error("Failed to parse skilljson JSON. Preview:\n" + preview);
+  }
+
+  return { skillJson, indexJs };
 }
 
 // Generates a skill from plain English. Ask at most 2 blocker questions.
 // MUST still draft code even if questions exist.
 async function generateSkillFromSpec({ skillName, request, existing }) {
-  const system =
-    "You are Clawdbot Dev. The user gives a simple request. Default: assume reasonable defaults and ship. " +
-    "Only ask questions if truly blocking. Ask at most 2 short questions. " +
-    "Output ONLY JSON (or ```json fenced) with keys: skillJson (object), indexJs (string), optional questions (array). " +
-    "The skill must export: export async function run({ bot, chatId, text }) { ... return true/false }. " +
-    "Keep output robust and minimal. Include a /help response. " +
-    "If external integration needed (Outlook/Gmail), include an /auth flow and required env vars in comments.";
+const system =
+  "You are Clawdbot Dev. The user gives a simple request. Default: assume reasonable defaults and ship. " +
+  "Only ask questions if truly blocking. Ask at most 2 short questions. " +
+  "OUTPUT FORMAT (no extra commentary):\n" +
+  "1) A fenced block ```skilljson containing ONLY valid JSON for skill.json\n" +
+  "2) A fenced block ```js containing the full index.js\n" +
+  "3) OPTIONAL: If you have blocker questions, add a fenced block ```questions containing a JSON array of strings.\n" +
+  "The skill must export: export async function run({ bot, chatId, text }) { ... return true/false }. " +
+  "Keep code robust and minimal. Include a /help response. " +
+  "If external integration needed (Outlook/Gmail), include an /auth flow and required env vars in comments.";
 
   const user = [
     `Skill name: ${skillName}`,
@@ -182,7 +204,16 @@ async function generateSkillFromSpec({ skillName, request, existing }) {
   ].join("\n");
 
   const out = await callClaude({ system, user });
-  const parsed = extractJsonBlock(out);
+  const parsed = extractFencedBlocks(out);
+
+const qMatch = out.match(/```questions\s*([\s\S]*?)\s*```/i);
+if (qMatch) {
+  try {
+    parsed.questions = JSON.parse(qMatch[1].trim());
+  } catch {
+    parsed.questions = null;
+  }
+}
 
   if (!parsed.skillJson || typeof parsed.indexJs !== "string") {
     throw new Error("Claude output missing skillJson or indexJs");
