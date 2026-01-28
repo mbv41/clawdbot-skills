@@ -11,6 +11,8 @@
   ],
   "entry": "index.js",
   "commands": [
-    "/test_skill"
+    "/test_skill",
+    "/test",
+    "/ok"
   ]
 }
