@@ -4,17 +4,25 @@ import os from "os";
 import { execSync } from "child_process";
 import Anthropic from "@anthropic-ai/sdk";
 
-const DRAFT_ROOT = path.join(os.homedir(), "clawdbot", "clawdbot_data", "skill_drafts");
-const REPO_WORKDIR = path.join(os.homedir(), "clawdbot", "clawdbot_data", "skills_repo");
+const HOME = os.homedir();
+
+// Repo + drafts live in your existing layout
+const DRAFT_ROOT = path.join(HOME, "clawdbot", "clawdbot_data", "skill_drafts");
+const REPO_WORKDIR = path.join(HOME, "clawdbot", "clawdbot_data", "skills_repo");
+
+// Where to store pending Qs for a skill
+function draftPaths(skillName) {
+  const draftDir = path.join(DRAFT_ROOT, skillName);
+  return {
+    draftDir,
+    skillJsonPath: path.join(draftDir, "skill.json"),
+    indexJsPath: path.join(draftDir, "index.js"),
+    pendingPath: path.join(draftDir, ".pending.json"),
+  };
+}
 
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
-}
-function safeName(name) {
-  if (!name) return null;
-  const n = name.trim();
-  if (!/^[a-zA-Z0-9_-]+$/.test(n)) return null;
-  return n;
 }
 function readFileSafe(p) {
   return fs.readFileSync(p, "utf8");
@@ -36,11 +44,19 @@ function splitForTelegram(text, max = 3500) {
   for (let i = 0; i < text.length; i += max) chunks.push(text.slice(i, i + max));
   return chunks;
 }
+function safeName(name) {
+  if (!name) return null;
+  const n = name.trim();
+  if (!/^[a-zA-Z0-9_-]+$/.test(n)) return null;
+  return n;
+}
+
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
+
 function git(cmd, cwd) {
   return execSync(`git ${cmd}`, { cwd, stdio: "pipe" }).toString("utf8").trim();
 }
@@ -50,6 +66,7 @@ function ensureRepoReady() {
   const token = requireEnv("GITHUB_TOKEN");
   const branch = process.env.GITHUB_SKILLS_BRANCH || "main";
 
+  // Use https token injection
   const authedUrl = repoUrl.replace(/^https:\/\//, `https://${token}@`);
 
   if (!fs.existsSync(path.join(REPO_WORKDIR, ".git"))) {
@@ -60,43 +77,34 @@ function ensureRepoReady() {
     git(`checkout ${branch}`, REPO_WORKDIR);
     git("pull", REPO_WORKDIR);
   }
+
   return { branch };
 }
 
-function draftPaths(skillName) {
-  const draftDir = path.join(DRAFT_ROOT, skillName);
-  return {
-    draftDir,
-    skillJsonPath: path.join(draftDir, "skill.json"),
-    indexJsPath: path.join(draftDir, "index.js"),
-    pendingPath: path.join(draftDir, ".pending.json"),
-  };
-}
-
-/* ✅ NEW: copy skill from GitHub repo into drafts */
 function copyRepoToDraft(skillName) {
   const { draftDir, skillJsonPath, indexJsPath } = draftPaths(skillName);
 
-  const repoDir = path.join(REPO_WORKDIR, "skills", skillName);
-  const repoSkillJson = path.join(repoDir, "skill.json");
-  const repoIndexJs = path.join(repoDir, "index.js");
+  const repoSkillDir = path.join(REPO_WORKDIR, "skills", skillName);
+  const repoSkillJson = path.join(repoSkillDir, "skill.json");
+  const repoIndex = path.join(repoSkillDir, "index.js");
 
-  if (!fs.existsSync(repoSkillJson) || !fs.existsSync(repoIndexJs)) {
+  if (!fs.existsSync(repoSkillJson) || !fs.existsSync(repoIndex)) {
     throw new Error(`Skill not found in repo: skills/${skillName}`);
   }
 
   ensureDir(draftDir);
   writeFileSafe(skillJsonPath, readFileSafe(repoSkillJson));
-  writeFileSafe(indexJsPath, readFileSafe(repoIndexJs));
+  writeFileSafe(indexJsPath, readFileSafe(repoIndex));
 }
 
 function copyDraftToRepo(skillName) {
   const { skillJsonPath, indexJsPath } = draftPaths(skillName);
 
   if (!fs.existsSync(skillJsonPath) || !fs.existsSync(indexJsPath)) {
-    throw new Error(`Draft '${skillName}' missing skill.json or index.js.`);
+    throw new Error(`Draft '${skillName}' missing skill.json or index.js. Try: /dev show ${skillName}`);
   }
 
+  // validate JSON
   JSON.parse(readFileSafe(skillJsonPath));
 
   const destDir = path.join(REPO_WORKDIR, "skills", skillName);
@@ -154,19 +162,23 @@ function extractJsonBlock(text) {
   return JSON.parse(raw);
 }
 
+// Generates a skill from plain English. Ask at most 2 blocker questions.
+// MUST still draft code even if questions exist.
 async function generateSkillFromSpec({ skillName, request, existing }) {
   const system =
-    "You are Clawdbot Dev. The user provides simple language describing what they want. " +
-    "Default behavior: assume reasonable defaults and implement a working skill. " +
-    "Only ask questions if missing information is a true blocker. Ask at most 2 short questions. " +
-    "Output ONLY JSON with keys: skillJson, indexJs, and optionally questions.";
+    "You are Clawdbot Dev. The user gives a simple request. Default: assume reasonable defaults and ship. " +
+    "Only ask questions if truly blocking. Ask at most 2 short questions. " +
+    "Output ONLY JSON (or ```json fenced) with keys: skillJson (object), indexJs (string), optional questions (array). " +
+    "The skill must export: export async function run({ bot, chatId, text }) { ... return true/false }. " +
+    "Keep output robust and minimal. Include a /help response. " +
+    "If external integration needed (Outlook/Gmail), include an /auth flow and required env vars in comments.";
 
   const user = [
     `Skill name: ${skillName}`,
     `User request: ${request}`,
-    existing
-      ? `Existing skill.json:\n${existing.skillJson}\n\nExisting index.js:\n${existing.indexJs}`
-      : "No existing code.",
+    existing ? `Existing skill.json:\n${existing.skillJson}\n\nExisting index.js:\n${existing.indexJs}` : "No existing code.",
+    "",
+    "Remember: Output JSON only.",
   ].join("\n");
 
   const out = await callClaude({ system, user });
@@ -176,13 +188,17 @@ async function generateSkillFromSpec({ skillName, request, existing }) {
     throw new Error("Claude output missing skillJson or indexJs");
   }
 
-  if (!Array.isArray(parsed.skillJson.commands)) parsed.skillJson.commands = [];
-  const cmd = `/${skillName}`;
-  if (!parsed.skillJson.commands.includes(cmd)) parsed.skillJson.commands.unshift(cmd);
+  if (parsed.questions && !Array.isArray(parsed.questions)) parsed.questions = null;
+  if (Array.isArray(parsed.questions)) parsed.questions = parsed.questions.slice(0, 2);
 
+  // normalize manifest
   parsed.skillJson.name = skillName;
   parsed.skillJson.entry = "index.js";
   if (!parsed.skillJson.version) parsed.skillJson.version = "0.1.0";
+  if (!Array.isArray(parsed.skillJson.commands)) parsed.skillJson.commands = [];
+
+  const cmd = `/${skillName}`;
+  if (!parsed.skillJson.commands.includes(cmd)) parsed.skillJson.commands.unshift(cmd);
 
   return parsed;
 }
@@ -203,40 +219,230 @@ export async function run({ bot, chatId, text }) {
   if (!trimmed.startsWith("/dev")) return false;
 
   ensureDir(DRAFT_ROOT);
+
   const parts = trimmed.split(/\s+/);
+  if (parts.length === 1) {
+    await bot.sendMessage(
+      chatId,
+      [
+        "Dev commands:",
+        "- /dev make <skill> <request>",
+        "- /dev revise <skill> <changes>",
+        "- /dev answer <skill> <answers...>",
+        "- /dev pull <skill>",
+        "- /dev show <skill>",
+        "- /dev publish <skill> \"commit msg\"",
+        "- /dev list",
+        "- /dev rm <skill>",
+      ].join("\n")
+    );
+    return true;
+  }
+
   const sub = parts[1];
 
-  if (!sub) {
-    await bot.sendMessage(chatId,
-      "Dev commands:\n" +
-      "- /dev make <skill> <request>\n" +
-      "- /dev revise <skill> <changes>\n" +
-      "- /dev pull <skill>\n" +
-      "- /dev show <skill>\n" +
-      "- /dev publish <skill>\n" +
-      "- /dev list\n"
+  if (sub === "list") {
+    const names = listDirs(DRAFT_ROOT);
+    await bot.sendMessage(
+      chatId,
+      names.length ? "Drafted skills:\n" + names.map((n) => `- ${n}`).join("\n") : "No drafted skills yet. Use: /dev make <skill> <request>"
     );
+    return true;
+  }
+
+  if (sub === "rm") {
+    const name = safeName(parts[2]);
+    if (!name) {
+      await bot.sendMessage(chatId, "Usage: /dev rm <skill>");
+      return true;
+    }
+    const { draftDir } = draftPaths(name);
+    if (!fs.existsSync(draftDir)) {
+      await bot.sendMessage(chatId, `No draft found for '${name}'.`);
+      return true;
+    }
+    fs.rmSync(draftDir, { recursive: true, force: true });
+    await bot.sendMessage(chatId, `🗑️ Deleted draft '${name}'.`);
     return true;
   }
 
   if (sub === "pull") {
     const name = safeName(parts[2]);
     if (!name) {
-      await bot.sendMessage(chatId, "Usage: /dev pull <skillname>");
+      await bot.sendMessage(chatId, "Usage: /dev pull <skill>");
       return true;
     }
     try {
-      await bot.sendMessage(chatId, `⏳ Pulling '${name}' from GitHub...`);
+      await bot.sendMessage(chatId, `⏳ Pulling '${name}' from GitHub into drafts...`);
       ensureRepoReady();
       copyRepoToDraft(name);
       await bot.sendMessage(chatId, `✅ Pulled. Review with: /dev show ${name}`);
     } catch (err) {
-      await bot.sendMessage(chatId, `⚠️ Pull failed: ${err.message}`);
+      await bot.sendMessage(chatId, `⚠️ Pull failed: ${err?.message || String(err)}`);
     }
     return true;
   }
 
-  /* existing make / revise / show / publish / answer logic remains unchanged */
+  if (sub === "show") {
+    const name = safeName(parts[2]);
+    if (!name) {
+      await bot.sendMessage(chatId, "Usage: /dev show <skill>");
+      return true;
+    }
+    const { skillJsonPath, indexJsPath } = draftPaths(name);
+    if (!fs.existsSync(skillJsonPath) || !fs.existsSync(indexJsPath)) {
+      await bot.sendMessage(chatId, `No draft found for '${name}'. Use: /dev make ${name} <request>`);
+      return true;
+    }
+
+    const combined =
+`skills/${name}/skill.json
+\`\`\`json
+${readFileSafe(skillJsonPath)}\`\`\`
+
+skills/${name}/index.js
+\`\`\`js
+${readFileSafe(indexJsPath)}\`\`\`
+`;
+
+    for (const chunk of splitForTelegram(combined)) await bot.sendMessage(chatId, chunk);
+    return true;
+  }
+
+  if (sub === "publish") {
+    const name = safeName(parts[2]);
+    if (!name) {
+      await bot.sendMessage(chatId, 'Usage: /dev publish <skill> "commit message"');
+      return true;
+    }
+    const msgStart = trimmed.indexOf(name) + name.length;
+    const commitMsg = trimmed.slice(msgStart).trim().replace(/^"|"$/g, "");
+
+    try {
+      await bot.sendMessage(chatId, `⏳ Publishing '${name}' to GitHub...`);
+      ensureRepoReady();
+      copyDraftToRepo(name);
+      const res = commitAndPush(name, commitMsg);
+      if (!res.didCommit) await bot.sendMessage(chatId, `✅ Repo already up-to-date for '${name}'. Nothing to commit.`);
+      else await bot.sendMessage(chatId, `✅ Published '${name}' (commit ${res.commit}).`);
+      await bot.sendMessage(chatId, `Ready to install: /install ${name}`);
+    } catch (err) {
+      await bot.sendMessage(chatId, `⚠️ Publish failed: ${err?.message || String(err)}`);
+    }
+    return true;
+  }
+
+  if (sub === "make" || sub === "revise") {
+    const name = safeName(parts[2]);
+    if (!name) {
+      await bot.sendMessage(chatId, `Usage: /dev ${sub} <skill> <request...>`);
+      return true;
+    }
+
+    const request = parts.slice(3).join(" ").trim();
+    if (!request) {
+      await bot.sendMessage(chatId, `Usage: /dev ${sub} ${name} <request...>`);
+      return true;
+    }
+
+    const { draftDir, skillJsonPath, indexJsPath, pendingPath } = draftPaths(name);
+    ensureDir(draftDir);
+
+    const existing =
+      fs.existsSync(skillJsonPath) && fs.existsSync(indexJsPath)
+        ? { skillJson: readFileSafe(skillJsonPath), indexJs: readFileSafe(indexJsPath) }
+        : null;
+
+    try {
+      await bot.sendMessage(chatId, `🧠 ${sub === "make" ? "Building" : "Revising"} '${name}'...`);
+
+      const gen = await generateSkillFromSpec({ skillName: name, request, existing });
+
+      writeFileSafe(skillJsonPath, JSON.stringify(gen.skillJson, null, 2) + "\n");
+      writeFileSafe(indexJsPath, gen.indexJs.endsWith("\n") ? gen.indexJs : gen.indexJs + "\n");
+
+      if (Array.isArray(gen.questions) && gen.questions.length > 0) {
+        savePending(pendingPath, { skillName: name, lastRequest: request, questions: gen.questions });
+
+        await bot.sendMessage(
+          chatId,
+          `⚠️ I can ship this now, but I have ${gen.questions.length} blocker question(s):\n` +
+            gen.questions.map((q, i) => `${i + 1}) ${q}`).join("\n") +
+            `\n\nReply with:\n/dev answer ${name} <your answers>`
+        );
+        await bot.sendMessage(chatId, `Draft ready for review: /dev show ${name}`);
+        return true;
+      }
+
+      await bot.sendMessage(chatId, `✅ Draft ready. ⏳ Publishing '${name}' to GitHub...`);
+      ensureRepoReady();
+      copyDraftToRepo(name);
+      const res = commitAndPush(name, `${sub}: ${name}`);
+
+      if (!res.didCommit) await bot.sendMessage(chatId, `✅ Repo already up-to-date for '${name}'. Nothing to commit.`);
+      else await bot.sendMessage(chatId, `✅ Published '${name}' (commit ${res.commit}).`);
+
+      await bot.sendMessage(chatId, `Done. Install when ready: /install ${name}\nOr review: /dev show ${name}`);
+    } catch (err) {
+      await bot.sendMessage(chatId, `⚠️ ${sub} failed: ${err?.message || String(err)}`);
+    }
+
+    return true;
+  }
+
+  if (sub === "answer") {
+    const name = safeName(parts[2]);
+    if (!name) {
+      await bot.sendMessage(chatId, "Usage: /dev answer <skill> <answers...>");
+      return true;
+    }
+
+    const answers = parts.slice(3).join(" ").trim();
+    if (!answers) {
+      await bot.sendMessage(chatId, `Usage: /dev answer ${name} <answers...>`);
+      return true;
+    }
+
+    const { skillJsonPath, indexJsPath, pendingPath } = draftPaths(name);
+    const pending = loadPending(pendingPath);
+
+    if (!pending) {
+      await bot.sendMessage(chatId, `No pending questions for '${name}'. Use: /dev make ${name} <request>`);
+      return true;
+    }
+
+    const existing =
+      fs.existsSync(skillJsonPath) && fs.existsSync(indexJsPath)
+        ? { skillJson: readFileSafe(skillJsonPath), indexJs: readFileSafe(indexJsPath) }
+        : null;
+
+    const combinedRequest =
+      `${pending.lastRequest}\n\nUser answers:\n${answers}\n\n(Proceed with best defaults; no more questions unless truly blocked.)`;
+
+    try {
+      await bot.sendMessage(chatId, `🧠 Applying answers and finishing '${name}'...`);
+
+      const gen = await generateSkillFromSpec({ skillName: name, request: combinedRequest, existing });
+
+      writeFileSafe(skillJsonPath, JSON.stringify(gen.skillJson, null, 2) + "\n");
+      writeFileSafe(indexJsPath, gen.indexJs.endsWith("\n") ? gen.indexJs : gen.indexJs + "\n");
+      clearPending(pendingPath);
+
+      await bot.sendMessage(chatId, `✅ Updated draft. ⏳ Publishing '${name}' to GitHub...`);
+      ensureRepoReady();
+      copyDraftToRepo(name);
+      const res = commitAndPush(name, `answer: ${name}`);
+
+      if (!res.didCommit) await bot.sendMessage(chatId, `✅ Repo already up-to-date for '${name}'. Nothing to commit.`);
+      else await bot.sendMessage(chatId, `✅ Published '${name}' (commit ${res.commit}).`);
+
+      await bot.sendMessage(chatId, `Done. Install when ready: /install ${name}\nOr review: /dev show ${name}`);
+    } catch (err) {
+      await bot.sendMessage(chatId, `⚠️ answer failed: ${err?.message || String(err)}`);
+    }
+
+    return true;
+  }
 
   await bot.sendMessage(chatId, "Unknown subcommand. Send /dev for help.");
   return true;
