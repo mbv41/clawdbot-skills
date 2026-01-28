@@ -1,0 +1,33 @@
+{
+  "name": "outlook_inbox",
+  "displayName": "Outlook Inbox Summary",
+  "description": "Read Microsoft 365 Outlook emails for today, summarize them, extract to-do items, and track frequent senders with importance.",
+  "triggers": [
+    {
+      "type": "command",
+      "pattern": "/outlook"
+    },
+    {
+      "type": "command",
+      "pattern": "/inbox"
+    }
+  ],
+  "auth": {
+    "type": "oauth2",
+    "provider": "microsoft",
+    "scopes": [
+      "Mail.Read",
+      "User.Read"
+    ]
+  },
+  "env": [
+    "MICROSOFT_CLIENT_ID",
+    "MICROSOFT_CLIENT_SECRET",
+    "MICROSOFT_TENANT_ID"
+  ],
+  "entry": "index.js",
+  "version": "0.1.0",
+  "commands": [
+    "/outlook_inbox"
+  ]
+}
