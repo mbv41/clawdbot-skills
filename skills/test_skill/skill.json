@@ -1,0 +1,16 @@
+{
+  "name": "test_skill",
+  "description": "A simple skill that replies 'ok' to any message",
+  "version": "1.0.0",
+  "triggers": [
+    "/test",
+    "/ok"
+  ],
+  "permissions": [
+    "send_messages"
+  ],
+  "entry": "index.js",
+  "commands": [
+    "/test_skill"
+  ]
+}
