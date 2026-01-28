@@ -157,8 +157,8 @@ async function callClaude({ system, user }) {
 }
 
 function extractFencedBlocks(text) {
-  const skillJsonMatch = text.match(/```skilljson\s*([\s\S]*?)\s*```/i);
-  const jsMatch = text.match(/```(?:js|javascript|jsx|ts|typescript)\s*([\s\S]*?)\s*```/i);
+  const skillJsonMatch = text.match(/```skilljson\s*([\s\S]*?)(?:\s*```|$)/i);
+  const jsMatch = text.match(/```(?:js|javascript|jsx|ts|typescript)\s*([\s\S]*?)(?:\s*```|$)/i);
 
   if (!skillJsonMatch || !jsMatch) {
     const preview = (text || "").slice(0, 800);
