@@ -1,0 +1,9 @@
+{
+  "name": "inbox_today",
+  "version": "0.1.0",
+  "description": "TODO: describe this skill",
+  "entry": "index.js",
+  "commands": [
+    "/inbox_today"
+  ]
+}
