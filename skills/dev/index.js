@@ -330,9 +330,44 @@ async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
 
   const out = await callClaude({ system, user });
 
-  const m = out.match(/```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```/);
-  if (!m) throw new Error("Model did not return a fenced code block with updated file.");
-  return m[1].replace(/\r\n/g, "\n");
+  function extract(outText) {
+    const m = outText.match(/```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```/);
+    if (m) return m[1].replace(/\r\n/g, "\n").trim();
+
+    // Last-resort fallback: if it looks like a full file, accept it
+    const t = (outText || "").replace(/\r\n/g, "\n").trim();
+    const looksLikeJs =
+      t.startsWith("import ") ||
+      t.startsWith("const ") ||
+      t.startsWith("function ") ||
+      t.includes("export ") ||
+      t.includes("module.exports") ||
+      t.includes("bot.on(");
+
+    if (looksLikeJs) return t;
+    return null;
+  }
+
+  let extracted = extract(out);
+  if (!extracted) {
+    // Retry once with a harsher instruction
+    const out2 = await callClaude({
+      system:
+        system +
+        " CRITICAL: Your response MUST be exactly one fenced code block with the full updated file content. No other text.",
+      user:
+        user +
+        "\n\nCRITICAL: Reply with ONLY one fenced code block containing the entire updated file. No explanation.",
+    });
+
+    extracted = extract(out2);
+  }
+
+  if (!extracted) {
+    throw new Error("Model did not return a usable updated file (no code fence, and output did not look like code).");
+  }
+
+  return extracted + "\n";
 }
 
 function maybeSyntaxCheck(filePath) {
