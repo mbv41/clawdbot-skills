@@ -4,9 +4,26 @@ import os from "os";
 import { execSync } from "child_process";
 import Anthropic from "@anthropic-ai/sdk";
 
-const DRAFT_ROOT = path.join(os.homedir(), "clawdbot", "clawdbot_data", "skill_drafts");
-const REPO_WORKDIR = path.join(os.homedir(), "clawdbot", "clawdbot_data", "skills_repo");
+/**
+ * Dev skill provides:
+ * - /dev make|revise ... (LLM generates a skill, drafts saved, auto-publish)
+ * - /dev show/list/rm/pull/publish
+ * - /dev edit <path> <instruction...> (safe file editing within allowed roots)
+ *
+ * Requires env vars:
+ * - ANTHROPIC_API_KEY
+ * - GITHUB_SKILLS_REPO_URL   (https URL to your skills repo)
+ * - GITHUB_TOKEN            (token with repo write access)
+ * Optional:
+ * - ANTHROPIC_MODEL         (default claude-opus-4-5-20251101)
+ * - GITHUB_SKILLS_BRANCH    (default main)
+ */
 
+const HOME = os.homedir();
+const DRAFT_ROOT = path.join(HOME, "clawdbot", "clawdbot_data", "skill_drafts");
+const REPO_WORKDIR = path.join(HOME, "clawdbot", "clawdbot_data", "skills_repo");
+
+// ===== helpers =====
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
@@ -70,55 +87,6 @@ function ensureRepoReady() {
   return { branch };
 }
 
-function draftPaths(skillName) {
-  const draftDir = path.join(DRAFT_ROOT, skillName);
-  return {
-    draftDir,
-    skillJsonPath: path.join(draftDir, "skill.json"),
-    indexJsPath: path.join(draftDir, "index.js"),
-    pendingPath: path.join(draftDir, ".pending.json"),
-  };
-}
-
-function copyDraftToRepo(skillName) {
-  const { skillJsonPath, indexJsPath } = draftPaths(skillName);
-
-  if (!fs.existsSync(skillJsonPath) || !fs.existsSync(indexJsPath)) {
-    throw new Error(`Draft '${skillName}' missing skill.json or index.js. Try: /dev show ${skillName}`);
-  }
-
-  JSON.parse(readFileSafe(skillJsonPath));
-
-  const destDir = path.join(REPO_WORKDIR, "skills", skillName);
-  ensureDir(destDir);
-
-  writeFileSafe(path.join(destDir, "skill.json"), readFileSafe(skillJsonPath));
-  writeFileSafe(path.join(destDir, "index.js"), readFileSafe(indexJsPath));
-}
-
-function copyRepoSkillToDraft(skillName) {
-  const repoSkillDir = path.join(REPO_WORKDIR, "skills", skillName);
-  if (!fs.existsSync(repoSkillDir)) {
-    throw new Error(`Skill not found in repo: skills/${skillName}`);
-  }
-
-  const srcSkillJson = path.join(repoSkillDir, "skill.json");
-  const srcIndex = path.join(repoSkillDir, "index.js");
-
-  if (!fs.existsSync(srcSkillJson) || !fs.existsSync(srcIndex)) {
-    throw new Error(`Repo skill '${skillName}' missing skill.json or index.js`);
-  }
-
-  const { draftDir, skillJsonPath, indexJsPath } = draftPaths(skillName);
-  ensureDir(draftDir);
-
-  // Validate JSON
-  JSON.parse(readFileSafe(srcSkillJson));
-
-  writeFileSafe(skillJsonPath, readFileSafe(srcSkillJson));
-  writeFileSafe(indexJsPath, readFileSafe(srcIndex));
-}
-
 function commitAndPush(skillName, message) {
   const branch = process.env.GITHUB_SKILLS_BRANCH || "main";
 
@@ -142,14 +110,77 @@ function commitAndPush(skillName, message) {
   return { didCommit: true, branch, commit: head };
 }
 
+function draftPaths(skillName) {
+  const draftDir = path.join(DRAFT_ROOT, skillName);
+  return {
+    draftDir,
+    skillJsonPath: path.join(draftDir, "skill.json"),
+    indexJsPath: path.join(draftDir, "index.js"),
+    pendingPath: path.join(draftDir, ".pending.json"),
+  };
+}
+
+function copyDraftToRepo(skillName) {
+  const { skillJsonPath, indexJsPath } = draftPaths(skillName);
+
+  if (!fs.existsSync(skillJsonPath) || !fs.existsSync(indexJsPath)) {
+    throw new Error(`Draft '${skillName}' missing skill.json or index.js. Try: /dev show ${skillName}`);
+  }
+
+  // validate JSON
+  JSON.parse(readFileSafe(skillJsonPath));
+
+  const destDir = path.join(REPO_WORKDIR, "skills", skillName);
+  ensureDir(destDir);
+
+  writeFileSafe(path.join(destDir, "skill.json"), readFileSafe(skillJsonPath));
+  writeFileSafe(path.join(destDir, "index.js"), readFileSafe(indexJsPath));
+}
+
+function copyRepoSkillToDraft(skillName) {
+  const repoSkillDir = path.join(REPO_WORKDIR, "skills", skillName);
+  if (!fs.existsSync(repoSkillDir)) {
+    throw new Error(`Skill not found in repo: skills/${skillName}`);
+  }
+
+  const srcSkillJson = path.join(repoSkillDir, "skill.json");
+  const srcIndex = path.join(repoSkillDir, "index.js");
+
+  if (!fs.existsSync(srcSkillJson) || !fs.existsSync(srcIndex)) {
+    throw new Error(`Repo skill '${skillName}' missing skill.json or index.js`);
+  }
+
+  // validate JSON
+  JSON.parse(readFileSafe(srcSkillJson));
+
+  const { draftDir, skillJsonPath, indexJsPath } = draftPaths(skillName);
+  ensureDir(draftDir);
+
+  writeFileSafe(skillJsonPath, readFileSafe(srcSkillJson));
+  writeFileSafe(indexJsPath, readFileSafe(srcIndex));
+}
+
+function savePending(pendingPath, payload) {
+  writeFileSafe(pendingPath, JSON.stringify(payload, null, 2) + "\n");
+}
+function loadPending(pendingPath) {
+  if (!fs.existsSync(pendingPath)) return null;
+  return JSON.parse(readFileSafe(pendingPath));
+}
+function clearPending(pendingPath) {
+  if (fs.existsSync(pendingPath)) fs.rmSync(pendingPath, { force: true });
+}
+
+// ===== Anthropic call =====
 async function callClaude({ system, user }) {
   const apiKey = requireEnv("ANTHROPIC_API_KEY");
   const model = process.env.ANTHROPIC_MODEL || "claude-opus-4-5-20251101";
+
   const client = new Anthropic({ apiKey });
 
   const resp = await client.messages.create({
     model,
-    max_tokens: 4000,
+    max_tokens: 4200,
     system,
     messages: [{ role: "user", content: user }],
   });
@@ -160,16 +191,24 @@ async function callClaude({ system, user }) {
     .trim();
 }
 
-// Parse outputs like:
-// ```skilljson { ... } ```
-// ```js ... ```
-// optional: ```questions ["..."] ```
-function extractFencedBlocks(text) {
+// ===== /dev make output parsing =====
+// Expected format:
+// ```skilljson
+// { ... valid JSON ... }
+// ```
+// ```js
+// ... full index.js ...
+// ```
+// optional:
+// ```questions
+// ["...", "..."]
+// ```
+function extractMakeBlocks(text) {
   const skillJsonMatch = text.match(/```skilljson\s*([\s\S]*?)(?:\s*```|$)/i);
-  const jsMatch = text.match(/```(?:js|javascript|jsx|ts|typescript)\s*([\s\S]*?)(?:\s*```|$)/i);
+  const jsMatch = text.match(/```(?:js|javascript)\s*([\s\S]*?)(?:\s*```|$)/i);
 
   if (!skillJsonMatch || !jsMatch) {
-    const preview = (text || "").slice(0, 800);
+    const preview = (text || "").slice(0, 900);
     throw new Error("Model output missing ```skilljson``` or ```js``` block. Preview:\n" + preview);
   }
 
@@ -179,9 +218,9 @@ function extractFencedBlocks(text) {
   let skillJson;
   try {
     skillJson = JSON.parse(skillJsonRaw);
-  } catch (e) {
-    const preview = skillJsonRaw.slice(0, 800);
-    throw new Error("Failed to parse skilljson JSON. Preview:\n" + preview);
+  } catch {
+    const preview = skillJsonRaw.slice(0, 900);
+    throw new Error("```skilljson``` was not valid JSON. Preview:\n" + preview);
   }
 
   const qMatch = text.match(/```questions\s*([\s\S]*?)(?:\s*```|$)/i);
@@ -196,19 +235,23 @@ function extractFencedBlocks(text) {
   return { skillJson, indexJs, questions };
 }
 
-// ✅ ask blocker questions otherwise ship
+// ✅ ask blocker questions, otherwise ship
 async function generateSkillFromSpec({ skillName, request, existing }) {
   const system =
-    "You are Clawdbot Dev. The user gives a simple request. Default: assume reasonable defaults and implement a working skill. " +
-    "Only ask questions if missing information is a true blocker. Ask at most 2 short, direct questions. " +
-    "OUTPUT FORMAT (no extra commentary):\n" +
+    "You are Clawdbot Dev.\n" +
+    "The user provides simple language describing what they want.\n" +
+    "Default: assume reasonable defaults and implement a working skill.\n" +
+    "Only ask questions if missing information is a true blocker. Ask at most 2 short, direct questions.\n" +
+    "OUTPUT FORMAT: (no extra commentary)\n" +
     "1) ```skilljson containing ONLY valid JSON for skill.json\n" +
     "2) ```js containing the full index.js\n" +
     "3) OPTIONAL: ```questions containing a JSON array of strings (blocker questions)\n" +
-    "The skill must export: export async function run({ bot, chatId, text }) { ... return true/false }. " +
-    "Keep code minimal and robust. Include a /help response. " +
-    "Do not use filesystem/network unless explicitly requested. " +
-    "If an external integration is requested (Outlook/Gmail), generate the code + an /auth subcommand and list required env vars in comments.";
+    "Skill requirements:\n" +
+    "- Must export: export async function run({ bot, chatId, text }) { ... return true/false }\n" +
+    "- Must include /help behavior.\n" +
+    "- Keep code minimal & robust.\n" +
+    "- Do not use filesystem/network unless explicitly requested.\n" +
+    "- If external integration requested (Outlook/Gmail), include an /auth subcommand and list required env vars in comments.";
 
   const user = [
     `Skill name: ${skillName}`,
@@ -221,13 +264,9 @@ async function generateSkillFromSpec({ skillName, request, existing }) {
   ].join("\n");
 
   const out = await callClaude({ system, user });
-  const parsed = extractFencedBlocks(out);
+  const parsed = extractMakeBlocks(out);
 
-  if (!parsed.skillJson || typeof parsed.indexJs !== "string") {
-    throw new Error("Model output missing skillJson or indexJs");
-  }
-
-  // Normalize commands
+  // normalize manifest
   if (!Array.isArray(parsed.skillJson.commands)) parsed.skillJson.commands = [];
   const cmd = `/${skillName}`;
   if (!parsed.skillJson.commands.includes(cmd)) parsed.skillJson.commands.unshift(cmd);
@@ -239,41 +278,28 @@ async function generateSkillFromSpec({ skillName, request, existing }) {
   return parsed;
 }
 
-function savePending(pendingPath, payload) {
-  writeFileSafe(pendingPath, JSON.stringify(payload, null, 2) + "\n");
-}
-function loadPending(pendingPath) {
-  if (!fs.existsSync(pendingPath)) return null;
-  return JSON.parse(readFileSafe(pendingPath));
-}
-function clearPending(pendingPath) {
-  if (fs.existsSync(pendingPath)) fs.rmSync(pendingPath, { force: true });
-}
-
 // ===== /dev edit (safe file editing) =====
-const ALLOWED_ROOTS = [
-  path.join(os.homedir(), "clawdbot"),
-  path.join(os.homedir(), "clawdbot_data"),
-];
+const ALLOWED_ROOTS = [path.join(HOME, "clawdbot"), path.join(HOME, "clawdbot_data")];
 
 function resolveSafeTarget(userPath) {
   if (!userPath) return null;
 
+  // Allow relative paths relative to ~/clawdbot
   const raw = userPath.trim();
-  const base = path.join(os.homedir(), "clawdbot");
+  const base = path.join(HOME, "clawdbot");
   const abs = raw.startsWith("/") ? raw : path.join(base, raw);
 
-  let real;
+  let realParent;
   try {
     const parent = fs.existsSync(abs) ? abs : path.dirname(abs);
-    real = fs.realpathSync(parent);
+    realParent = fs.realpathSync(parent);
   } catch {
-    real = path.resolve(abs);
+    realParent = path.resolve(abs);
   }
 
   const ok = ALLOWED_ROOTS.some((r) => {
     const rr = fs.existsSync(r) ? fs.realpathSync(r) : path.resolve(r);
-    return real === rr || real.startsWith(rr + path.sep);
+    return realParent === rr || realParent.startsWith(rr + path.sep);
   });
 
   if (!ok) return null;
@@ -300,76 +326,6 @@ function writeFileAtomicWithBackup(filePath, content) {
   fs.renameSync(tmp, filePath);
 }
 
-async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
-  const system =
-    "You are a careful software engineer. " +
-    "Update the given file to satisfy the instruction. " +
-    "Preserve existing behavior unless required. Keep changes minimal. " +
-    "Output ONLY a single fenced code block containing the FULL updated file content. " +
-    "Do not include any explanation outside the code block.";
-
-  const ext = path.extname(filePath).toLowerCase();
-  const fence =
-    ext === ".js" || ext === ".mjs" || ext === ".cjs"
-      ? "js"
-      : ext === ".json"
-      ? "json"
-      : "text";
-
-  const user = [
-    `File path: ${filePath}`,
-    `Instruction: ${instruction}`,
-    "",
-    "CURRENT FILE:",
-    "```" + fence,
-    oldContent,
-    "```",
-    "",
-    "Return the FULL UPDATED FILE as a single fenced code block.",
-  ].join("\n");
-
-  const out = await callClaude({ system, user });
-
-  function extract(outText) {
-    const m = outText.match(/```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```/);
-    if (m) return m[1].replace(/\r\n/g, "\n").trim();
-
-    // Last-resort fallback: if it looks like a full file, accept it
-    const t = (outText || "").replace(/\r\n/g, "\n").trim();
-    const looksLikeJs =
-      t.startsWith("import ") ||
-      t.startsWith("const ") ||
-      t.startsWith("function ") ||
-      t.includes("export ") ||
-      t.includes("module.exports") ||
-      t.includes("bot.on(");
-
-    if (looksLikeJs) return t;
-    return null;
-  }
-
-  let extracted = extract(out);
-  if (!extracted) {
-    // Retry once with a harsher instruction
-    const out2 = await callClaude({
-      system:
-        system +
-        " CRITICAL: Your response MUST be exactly one fenced code block with the full updated file content. No other text.",
-      user:
-        user +
-        "\n\nCRITICAL: Reply with ONLY one fenced code block containing the entire updated file. No explanation.",
-    });
-
-    extracted = extract(out2);
-  }
-
-  if (!extracted) {
-    throw new Error("Model did not return a usable updated file (no code fence, and output did not look like code).");
-  }
-
-  return extracted + "\n";
-}
-
 function maybeSyntaxCheck(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
@@ -389,8 +345,74 @@ function maybeRestartPm2(filePath) {
   }
   return false;
 }
-// ===== end /dev edit =====
 
+// Sentinel-based extraction (reliable)
+async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
+  const system =
+    "You are a careful software engineer.\n" +
+    "Update the given file to satisfy the instruction.\n" +
+    "Preserve existing behavior unless required; keep changes minimal.\n" +
+    "CRITICAL OUTPUT RULE:\n" +
+    "Return ONLY the full updated file content between these exact markers:\n" +
+    "BEGIN_FILE\n" +
+    "<full file content>\n" +
+    "END_FILE\n" +
+    "No markdown. No code fences. No explanations. No extra text.\n" +
+    'If you cannot comply, output exactly: FAIL';
+
+  const user = [
+    `File path: ${filePath}`,
+    `Instruction: ${instruction}`,
+    "",
+    "CURRENT FILE:",
+    "-----BEGIN_CURRENT-----",
+    oldContent,
+    "-----END_CURRENT-----",
+    "",
+    "Remember: output ONLY BEGIN_FILE ... END_FILE (or FAIL).",
+  ].join("\n");
+
+  function extractSentinel(outText) {
+    const t = (outText || "").replace(/\r\n/g, "\n");
+    if (t.trim() === "FAIL") return null;
+    const m = t.match(/BEGIN_FILE\s*\n([\s\S]*?)\nEND_FILE\s*$/);
+    if (!m) return null;
+    return m[1];
+  }
+
+  // Try up to 3 times with increasing strictness
+  let out = await callClaude({ system, user });
+  let extracted = extractSentinel(out);
+
+  if (!extracted) {
+    out = await callClaude({
+      system: system + "\n\nYOU MUST COMPLY. Output ONLY the markers and the file content.",
+      user:
+        user +
+        "\n\nSECOND ATTEMPT: Your response MUST end with END_FILE and contain only the markers and the full file content.",
+    });
+    extracted = extractSentinel(out);
+  }
+
+  if (!extracted) {
+    out = await callClaude({
+      system: system + "\n\nFINAL ATTEMPT: Output must be ONLY the full file between markers. No other text.",
+      user:
+        user +
+        "\n\nFINAL ATTEMPT: Reply exactly in this format:\nBEGIN_FILE\n<full file>\nEND_FILE",
+    });
+    extracted = extractSentinel(out);
+  }
+
+  if (!extracted) {
+    const preview = (out || "").slice(0, 420).replace(/\n/g, "\\n");
+    throw new Error("Model did not return BEGIN_FILE/END_FILE content. Preview: " + preview);
+  }
+
+  return extracted.endsWith("\n") ? extracted : extracted + "\n";
+}
+
+// ===== command handler =====
 export async function run({ bot, chatId, text }) {
   const trimmed = (text || "").trim();
   if (!trimmed.startsWith("/dev")) return false;
@@ -404,8 +426,8 @@ export async function run({ bot, chatId, text }) {
       [
         "Dev commands:",
         "- /dev make <skillname> <what you want in plain English>",
-        "- /dev answer <skillname> <your answers...>",
         "- /dev revise <skillname> <changes in plain English>",
+        "- /dev answer <skillname> <your answers...>",
         "- /dev pull <skillname>",
         "- /dev show <skillname>",
         '- /dev publish <skillname> "commit msg"',
@@ -545,7 +567,7 @@ ${readFileSafe(indexJsPath)}\`\`\`
       const oldContent = readFileSafe(targetPath);
       const newContent = await callClaudeFileEdit({ filePath: targetPath, oldContent, instruction });
 
-      writeFileAtomicWithBackup(targetPath, newContent.endsWith("\n") ? newContent : newContent + "\n");
+      writeFileAtomicWithBackup(targetPath, newContent);
 
       try {
         maybeSyntaxCheck(targetPath);
@@ -555,7 +577,6 @@ ${readFileSafe(indexJsPath)}\`\`\`
       }
 
       const restarted = maybeRestartPm2(targetPath);
-
       await bot.sendMessage(chatId, `✅ Updated file saved.${restarted ? " (pm2 restarted clawdbot)" : ""}\nBackup created automatically in the same folder.`);
     } catch (err) {
       await bot.sendMessage(chatId, `⚠️ edit failed: ${err?.message || String(err)}`);
@@ -589,21 +610,14 @@ ${readFileSafe(indexJsPath)}\`\`\`
     try {
       await bot.sendMessage(chatId, `🧠 ${sub === "make" ? "Building" : "Revising"} '${name}'...`);
 
-      const gen = await generateSkillFromSpec({
-        skillName: name,
-        request,
-        existing,
-      });
+      const gen = await generateSkillFromSpec({ skillName: name, request, existing });
 
       writeFileSafe(skillJsonPath, JSON.stringify(gen.skillJson, null, 2) + "\n");
       writeFileSafe(indexJsPath, gen.indexJs.endsWith("\n") ? gen.indexJs : gen.indexJs + "\n");
 
+      // blocker questions
       if (Array.isArray(gen.questions) && gen.questions.length > 0) {
-        savePending(pendingPath, {
-          skillName: name,
-          lastRequest: request,
-          questions: gen.questions,
-        });
+        savePending(pendingPath, { skillName: name, lastRequest: request, questions: gen.questions });
 
         await bot.sendMessage(
           chatId,
@@ -616,8 +630,8 @@ ${readFileSafe(indexJsPath)}\`\`\`
         return true;
       }
 
+      // auto-publish
       await bot.sendMessage(chatId, `✅ Draft ready. ⏳ Publishing '${name}' to GitHub...`);
-
       ensureRepoReady();
       copyDraftToRepo(name);
       const res = commitAndPush(name, `${sub}: ${name}`);
@@ -666,11 +680,7 @@ ${readFileSafe(indexJsPath)}\`\`\`
     try {
       await bot.sendMessage(chatId, `🧠 Applying answers and finishing '${name}'...`);
 
-      const gen = await generateSkillFromSpec({
-        skillName: name,
-        request: combinedRequest,
-        existing,
-      });
+      const gen = await generateSkillFromSpec({ skillName: name, request: combinedRequest, existing });
 
       writeFileSafe(skillJsonPath, JSON.stringify(gen.skillJson, null, 2) + "\n");
       writeFileSafe(indexJsPath, gen.indexJs.endsWith("\n") ? gen.indexJs : gen.indexJs + "\n");
