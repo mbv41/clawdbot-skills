@@ -346,21 +346,31 @@ function maybeRestartPm2(filePath) {
   return false;
 }
 
-// Sentinel-based extraction (reliable)
+// Multi-part sentinel-based extraction (handles long files reliably)
 async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
   const system =
     "You are a careful software engineer.\n" +
     "Update the given file to satisfy the instruction.\n" +
     "Preserve existing behavior unless required; keep changes minimal.\n" +
+    "\n" +
     "CRITICAL OUTPUT RULE:\n" +
-    "Return ONLY the full updated file content between these exact markers:\n" +
+    "You MUST return the full updated file content using ONE of these formats:\n" +
+    "\n" +
+    "FORMAT A (single part):\n" +
     "BEGIN_FILE\n" +
     "<full file content>\n" +
     "END_FILE\n" +
+    "\n" +
+    "FORMAT B (multi-part for long files):\n" +
+    "BEGIN_FILE_PART i/N\n" +
+    "<this part's content>\n" +
+    "END_FILE_PART\n" +
+    "(repeat for all parts, in order, i from 1 to N)\n" +
+    "\n" +
     "No markdown. No code fences. No explanations. No extra text.\n" +
-    'If you cannot comply, output exactly: FAIL';
+    "If you cannot comply, output exactly: FAIL";
 
-  const user = [
+  const baseUser = [
     `File path: ${filePath}`,
     `Instruction: ${instruction}`,
     "",
@@ -369,47 +379,129 @@ async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
     oldContent,
     "-----END_CURRENT-----",
     "",
-    "Remember: output ONLY BEGIN_FILE ... END_FILE (or FAIL).",
+    "Remember: output ONLY the markers and the file content (or FAIL).",
   ].join("\n");
 
-  function extractSentinel(outText) {
-    const t = (outText || "").replace(/\r\n/g, "\n");
-    if (t.trim() === "FAIL") return null;
+  function norm(outText) {
+    return (outText || "").replace(/\r\n/g, "\n").trim();
+  }
+
+  function extractSingle(outText) {
+    const t = norm(outText);
+    if (t === "FAIL") return null;
     const m = t.match(/BEGIN_FILE\s*\n([\s\S]*?)\nEND_FILE\s*$/);
     if (!m) return null;
-    return m[1];
+    return { mode: "single", content: m[1] };
   }
 
-  // Try up to 3 times with increasing strictness
-  let out = await callClaude({ system, user });
-  let extracted = extractSentinel(out);
+  function extractParts(outText) {
+    const t = norm(outText);
+    if (t === "FAIL") return null;
 
-  if (!extracted) {
+    const re = /BEGIN_FILE_PART\s+(\d+)\/(\d+)\s*\n([\s\S]*?)\nEND_FILE_PART/g;
+    const parts = [];
+    let m;
+    while ((m = re.exec(t)) !== null) {
+      parts.push({
+        i: Number(m[1]),
+        n: Number(m[2]),
+        content: m[3],
+      });
+    }
+    if (parts.length === 0) return null;
+
+    const n = parts[0].n;
+    if (!n || parts.some((p) => p.n !== n)) return null;
+
+    const byI = new Map();
+    for (const p of parts) byI.set(p.i, p.content);
+
+    return { mode: "parts", n, byI };
+  }
+
+  function preview(outText) {
+    return norm(outText).slice(0, 420).replace(/\n/g, "\\n");
+  }
+
+  const clientAttempts = 6;
+
+  let out = await callClaude({ system, user: baseUser });
+
+  const single = extractSingle(out);
+  if (single) {
+    const c = single.content;
+    return c.endsWith("\n") ? c : c + "\n";
+  }
+
+  let partsState = extractParts(out);
+  if (!partsState) {
     out = await callClaude({
-      system: system + "\n\nYOU MUST COMPLY. Output ONLY the markers and the file content.",
+      system: system + "\n\nYOU MUST COMPLY. Output ONLY markers and file content.",
       user:
-        user +
-        "\n\nSECOND ATTEMPT: Your response MUST end with END_FILE and contain only the markers and the full file content.",
+        baseUser +
+        "\n\nSECOND ATTEMPT: If the file is long, use BEGIN_FILE_PART i/N blocks. No extra text.",
     });
-    extracted = extractSentinel(out);
+
+    const single2 = extractSingle(out);
+    if (single2) {
+      const c = single2.content;
+      return c.endsWith("\n") ? c : c + "\n";
+    }
+
+    partsState = extractParts(out);
   }
 
-  if (!extracted) {
-    out = await callClaude({
-      system: system + "\n\nFINAL ATTEMPT: Output must be ONLY the full file between markers. No other text.",
-      user:
-        user +
-        "\n\nFINAL ATTEMPT: Reply exactly in this format:\nBEGIN_FILE\n<full file>\nEND_FILE",
-    });
-    extracted = extractSentinel(out);
+  if (!partsState) {
+    throw new Error("Model did not return BEGIN_FILE/END_FILE content. Preview: " + preview(out));
   }
 
-  if (!extracted) {
-    const preview = (out || "").slice(0, 420).replace(/\n/g, "\\n");
-    throw new Error("Model did not return BEGIN_FILE/END_FILE content. Preview: " + preview);
+  const n = partsState.n;
+  const byI = partsState.byI;
+
+  for (let attempt = 0; attempt < clientAttempts; attempt++) {
+    if (byI.size >= n) break;
+
+    const missing = [];
+    for (let i = 1; i <= n; i++) if (!byI.has(i)) missing.push(i);
+
+    const ask =
+      baseUser +
+      "\n\nYou previously returned a multi-part file.\n" +
+      `Total parts: ${n}\n` +
+      `Missing parts: ${missing.join(", ")}\n\n` +
+      "Return ONLY the missing parts using EXACTLY this format (no extra text):\n" +
+      "BEGIN_FILE_PART i/N\n" +
+      "<content>\n" +
+      "END_FILE_PART\n" +
+      "(repeat for each missing part)\n";
+
+    out = await callClaude({ system, user: ask });
+
+    const got = extractParts(out);
+    if (!got || got.n !== n) {
+      const s = extractSingle(out);
+      if (s) {
+        const c = s.content;
+        return c.endsWith("\n") ? c : c + "\n";
+      }
+      continue;
+    }
+
+    for (const [i, c] of got.byI.entries()) byI.set(i, c);
   }
 
-  return extracted.endsWith("\n") ? extracted : extracted + "\n";
+  if (byI.size < n) {
+    const missing = [];
+    for (let i = 1; i <= n; i++) if (!byI.has(i)) missing.push(i);
+    throw new Error(
+      `Model returned multi-part file but missing parts: ${missing.join(", ")}. Last preview: ${preview(out)}`
+    );
+  }
+
+  let content = "";
+  for (let i = 1; i <= n; i++) content += byI.get(i);
+
+  return content.endsWith("\n") ? content : content + "\n";
 }
 
 // ===== command handler =====
