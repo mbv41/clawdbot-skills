@@ -386,6 +386,11 @@ async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
     return (outText || "").replace(/\r\n/g, "\n").trim();
   }
 
+  function looksLikeTruncatedSingle(outText) {
+    const t = norm(outText);
+    return t.startsWith("BEGIN_FILE\n") && !t.includes("\nEND_FILE");
+  }
+
   function extractSingle(outText) {
     const t = norm(outText);
     if (t === "FAIL") return null;
@@ -423,34 +428,43 @@ async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
     return norm(outText).slice(0, 420).replace(/\n/g, "\\n");
   }
 
-  const clientAttempts = 6;
-
+  // Attempt 1: normal request
   let out = await callClaude({ system, user: baseUser });
 
+  // If we got a complete single file, accept it
   const single = extractSingle(out);
   if (single) {
     const c = single.content;
     return c.endsWith("\n") ? c : c + "\n";
   }
 
-  let partsState = extractParts(out);
-  if (!partsState) {
+  // If the model started BEGIN_FILE but got truncated, immediately switch to multi-part
+  if (looksLikeTruncatedSingle(out)) {
+    out = await callClaude({
+      system: system + "\n\nIMPORTANT: Your last response was truncated. Use multi-part output now.",
+      user:
+        baseUser +
+        "\n\nYour previous output started BEGIN_FILE but was cut off. Now return the ENTIRE updated file using ONLY BEGIN_FILE_PART i/N blocks (no BEGIN_FILE).",
+    });
+  } else {
+    // Otherwise do a strict retry instructing multi-part as needed
     out = await callClaude({
       system: system + "\n\nYOU MUST COMPLY. Output ONLY markers and file content.",
       user:
         baseUser +
         "\n\nSECOND ATTEMPT: If the file is long, use BEGIN_FILE_PART i/N blocks. No extra text.",
     });
-
-    const single2 = extractSingle(out);
-    if (single2) {
-      const c = single2.content;
-      return c.endsWith("\n") ? c : c + "\n";
-    }
-
-    partsState = extractParts(out);
   }
 
+  // Maybe we got a complete single on retry
+  const single2 = extractSingle(out);
+  if (single2) {
+    const c = single2.content;
+    return c.endsWith("\n") ? c : c + "\n";
+  }
+
+  // Multi-part workflow
+  let partsState = extractParts(out);
   if (!partsState) {
     throw new Error("Model did not return BEGIN_FILE/END_FILE content. Preview: " + preview(out));
   }
@@ -458,6 +472,8 @@ async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
   const n = partsState.n;
   const byI = partsState.byI;
 
+  // Ask for missing parts until complete
+  const clientAttempts = 8;
   for (let attempt = 0; attempt < clientAttempts; attempt++) {
     if (byI.size >= n) break;
 
@@ -478,14 +494,7 @@ async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
     out = await callClaude({ system, user: ask });
 
     const got = extractParts(out);
-    if (!got || got.n !== n) {
-      const s = extractSingle(out);
-      if (s) {
-        const c = s.content;
-        return c.endsWith("\n") ? c : c + "\n";
-      }
-      continue;
-    }
+    if (!got || got.n !== n) continue;
 
     for (const [i, c] of got.byI.entries()) byI.set(i, c);
   }
@@ -498,6 +507,7 @@ async function callClaudeFileEdit({ filePath, oldContent, instruction }) {
     );
   }
 
+  // Stitch in order
   let content = "";
   for (let i = 1; i <= n; i++) content += byI.get(i);
 
